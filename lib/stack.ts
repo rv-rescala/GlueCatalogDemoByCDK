@@ -11,8 +11,9 @@ import {
   aws_lambda,
   aws_rds,
 } from 'aws-cdk-lib';
-import * as glue_alpha from '@aws-cdk/aws-glue-alpha';
 import * as cdk from 'aws-cdk-lib';
+import { Cluster } from 'aws-cdk-lib/aws-ecs';
+import { ServerlessCluster } from 'aws-cdk-lib/aws-rds';
 
 
 const PyMySQL_LAYER = 'arn:aws:lambda:ap-northeast-1:770693421928:layer:Klayers-p38-PyMySQL:1'
@@ -53,7 +54,7 @@ function getLambdaRole(stack: Stack, clusterSecretSecretArn: string) {
   return role
 }
 
-function createLambda(stack: Stack, vpc: aws_ec2.Vpc, clusterSecretSecretArn: string, name: string) {
+function createLambda(stack: Stack, vpc: aws_ec2.Vpc, cluster: ServerlessCluster, name: string) {
   const secretARNKey = `DB_SECRET_ARN_${name}`;
   const lambdaFunction = new aws_lambda.Function(stack, 'CreateUserTableLambda', {
     runtime: aws_lambda.Runtime.PYTHON_3_8,
@@ -61,10 +62,11 @@ function createLambda(stack: Stack, vpc: aws_ec2.Vpc, clusterSecretSecretArn: st
     code: aws_lambda.Code.fromAsset('lambda'),
     timeout: cdk.Duration.seconds(30),
     environment: {
-      secretARNKey: clusterSecretSecretArn,
+      [secretARNKey]: cluster.secret?.secretArn || '',
+      DB_CLUSTER_ARN: cluster.clusterArn
     },
     layers: [aws_lambda.LayerVersion.fromLayerVersionArn(stack, 'PyMySQL_LAYER', PyMySQL_LAYER)],
-    role: getLambdaRole(stack, clusterSecretSecretArn),
+    role: getLambdaRole(stack, cluster.secret?.secretArn || ''),
     vpc: vpc
   });
   return lambdaFunction
@@ -83,18 +85,21 @@ function createServerlessCluster(stack: Stack, vpc: aws_ec2.Vpc, name: string) {
       maxCapacity: aws_rds.AuroraCapacityUnit.ACU_8,
     },
     removalPolicy: cdk.RemovalPolicy.DESTROY,
+    enableDataApi: true
   });
   cluster.addRotationSingleUser({ automaticallyAfter: cdk.Duration.days(30) });
+
+  
   return cluster
 }
 
 export class GlueCatalogDemoStack extends Stack {
-  constructor(scope: Construct, id: string, props?: StackProps) {
+  constructor(scope: cdk.App, id: string, props?: StackProps) {
     super(scope, id, props);
 
     const vpc = getVPC(this)
     const cluster = createServerlessCluster(this, vpc, STACK_NAME)
-    const lambdaFunction = createLambda(this, vpc, cluster.secret?.secretArn || '', STACK_NAME)
+    const lambdaFunction = createLambda(this, vpc, cluster, STACK_NAME)
 
   }
 }
