@@ -10,31 +10,50 @@ import {
   aws_ec2,
   aws_lambda,
   aws_rds,
+  SecretValue
 } from 'aws-cdk-lib';
 import * as cdk from 'aws-cdk-lib';
 import { Cluster } from 'aws-cdk-lib/aws-ecs';
 import { ServerlessCluster } from 'aws-cdk-lib/aws-rds';
+import { Role, ServicePrincipal } from 'aws-cdk-lib/aws-iam';
 
 
 const PyMySQL_LAYER = 'arn:aws:lambda:ap-northeast-1:770693421928:layer:Klayers-p38-PyMySQL:1'
 const STACK_NAME = "GlueCatalogDemo"
+const AURORA_DB_NAME = "GlueCatalogDemo"
+const GLUE_DB_NAME = "gule_catalog_demo_db"
 
 function getVPC(stack: Stack) {
   return new aws_ec2.Vpc(stack, 'VPC', {});
 }
 
-function getLambdaRole(stack: Stack, clusterSecretSecretArn: string) {
+function getSecretPolicy(clusterSecretSecretArn: string) {
+  return new aws_iam.PolicyStatement({
+    effect: aws_iam.Effect.ALLOW,
+    actions: ['secretsmanager:GetSecretValue'],
+    resources: [clusterSecretSecretArn],
+  });
+}
+
+function createConnectionRole(stack: Stack, clusterSecretSecretArn: string) {
+  const role = new aws_iam.Role(stack, `${STACK_NAME}GlueConnectionRole`, {
+    assumedBy: new aws_iam.ServicePrincipal('lambda.amazonaws.com'),
+  });
+
+  // for SecretsManager
+  const secretPolicy = getSecretPolicy(clusterSecretSecretArn)
+  role.addToPolicy(secretPolicy);
+  return role
+}
+
+function createLmbdaRole(stack: Stack, clusterSecretSecretArn: string) {
   const role = new aws_iam.Role(stack, 'CreateUserTableLambdaRole', {
     assumedBy: new aws_iam.ServicePrincipal('lambda.amazonaws.com'),
   });
 
   // for SecretsManager
-  const getSecretPolicy = new aws_iam.PolicyStatement({
-    effect: aws_iam.Effect.ALLOW,
-    actions: ['secretsmanager:GetSecretValue'],
-    resources: [clusterSecretSecretArn],
-  });
-  role.addToPolicy(getSecretPolicy);
+  const secretPolicy = getSecretPolicy(clusterSecretSecretArn)
+  role.addToPolicy(secretPolicy);
 
   // for RDS
   const rdsAccessPolicy = new aws_iam.PolicyStatement({
@@ -66,7 +85,7 @@ function createLambda(stack: Stack, vpc: aws_ec2.Vpc, cluster: ServerlessCluster
       DB_CLUSTER_ARN: cluster.clusterArn
     },
     layers: [aws_lambda.LayerVersion.fromLayerVersionArn(stack, 'PyMySQL_LAYER', PyMySQL_LAYER)],
-    role: getLambdaRole(stack, cluster.secret?.secretArn || ''),
+    role: createLmbdaRole(stack, cluster.secret?.secretArn || ''),
     vpc: vpc
   });
   return lambdaFunction
@@ -78,7 +97,7 @@ function createServerlessCluster(stack: Stack, vpc: aws_ec2.Vpc, name: string) {
       version: aws_rds.AuroraMysqlEngineVersion.of('5.7.mysql_aurora.2.12.2')
     }),
     vpc,
-    defaultDatabaseName: `SC_${name}`,
+    defaultDatabaseName: AURORA_DB_NAME,
     scaling: {
       autoPause: cdk.Duration.minutes(5),
       minCapacity: aws_rds.AuroraCapacityUnit.ACU_1,
@@ -89,7 +108,7 @@ function createServerlessCluster(stack: Stack, vpc: aws_ec2.Vpc, name: string) {
   });
   cluster.addRotationSingleUser({ automaticallyAfter: cdk.Duration.days(30) });
 
-  
+
   return cluster
 }
 
@@ -98,8 +117,86 @@ export class GlueCatalogDemoStack extends Stack {
     super(scope, id, props);
 
     const vpc = getVPC(this)
+
     const cluster = createServerlessCluster(this, vpc, STACK_NAME)
     const lambdaFunction = createLambda(this, vpc, cluster, STACK_NAME)
 
+    // Create a Glue CfnDatabase
+    const database = new aws_glue.CfnDatabase(this, `${STACK_NAME}CfnDatabase`, {
+      catalogId: cdk.Aws.ACCOUNT_ID,
+      databaseInput: {
+        name: GLUE_DB_NAME,  
+      },
+    });
+
+    //const glueConnectionRole = createConnectionRole(this, cluster.secret?.secretArn || '')
+    const jdbcConnectionUrl = `jdbc:mysql://${cluster.clusterEndpoint.hostname}:${cluster.clusterEndpoint.port}/${AURORA_DB_NAME}`;
+    const connection = new aws_glue.CfnConnection(this, `${STACK_NAME}CfnConnection`, {
+      catalogId: cdk.Aws.ACCOUNT_ID,
+      connectionInput: {
+        name: "AuroraServerlessConnection",
+        connectionType: "JDBC",
+        description: `A Glue connection to the Aurora Serverless RDS database ${cluster.secret?.secretName}`,
+        connectionProperties: {
+          JDBC_CONNECTION_URL: jdbcConnectionUrl, // Fix the protocol
+          JDBC_ENFORCE_SSL: 'false',
+          SECRET_ID: cluster.secret?.secretName || '',
+        }
+      },
+    });
+
+    /*
+    // Glue Connection using CfnConnection
+    
+    //const jdbcConnectionUrl = `jdbc:mysql://${cluster.clusterEndpoint.hostname}:${cluster.clusterEndpoint.port}/${DB_NAME}`;
+    new aws_glue.CfnConnection(this, 'MyGlueConnection', {
+      catalogId: cdk.Aws.ACCOUNT_ID, // Use the current account ID
+      connectionInput: {
+        name: 'MyGlueConnection',
+        connectionType: 'JDBC',
+        connectionProperties: {
+          JDBC_CONNECTION_URL: 'jdbc:mysql://your-endpoint:3306/your-db-name', // Fix the protocol
+          JDBC_ENFORCE_SSL: 'false',
+          USERNAME: 'a', // Fix the property name
+          PASSWORD: 'a', // Fix the property name
+        }
+      },
+    });
+    */
+    
+    
+    // Create a Glue CfnConnection to the Aurora Serverless database
+    //const glueConnectionRole = createConnectionRole(this, cluster.secret?.secretArn || '')
+    //const jdbcConnectionUrl = `jdbc:mysql://${cluster.clusterEndpoint.hostname}:${cluster.clusterEndpoint.port}/${DB_NAME}`;
+    /*
+    const connection = new aws_glue.CfnConnection(this, `${STACK_NAME}CfnConnection`, {
+      catalogId: cdk.Aws.ACCOUNT_ID,
+      connectionInput: {
+        name: "AuroraServerlessConnection",
+        connectionType: "JDBC",
+        description: `A Glue connection to the Aurora Serverless RDS database ${cluster.clusterEndpoint.socketAddress}`,
+      },
+    });
+
+    
+    // Create a Glue Crawler to crawl the database
+    const glueServiceRole = new aws_iam.Role(this, 'GlueServiceRole', {
+      assumedBy: new aws_iam.ServicePrincipal('glue.amazonaws.com'),
+    });
+
+    const crawler = new aws_glue.CfnCrawler(this, "DatabaseCrawler", {
+      name: "DatabaseCrawler",
+      role: glueServiceRole.roleArn,
+      databaseName: database.ref,
+      targets: {
+        s3Targets: [],
+        jdbcTargets: [{
+          connectionName: connection.ref,
+          path: "",
+          exclusions: []
+        }]
+      },
+    });
+    */
   }
 }
