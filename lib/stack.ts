@@ -17,7 +17,6 @@ import { Cluster } from 'aws-cdk-lib/aws-ecs';
 import { ServerlessCluster } from 'aws-cdk-lib/aws-rds';
 import { Role, ServicePrincipal } from 'aws-cdk-lib/aws-iam';
 
-
 const PyMySQL_LAYER = 'arn:aws:lambda:ap-northeast-1:770693421928:layer:Klayers-p38-PyMySQL:1'
 const STACK_NAME = "GlueCatalogDemo"
 const AURORA_DB_NAME = "GlueCatalogDemo"
@@ -107,9 +106,56 @@ function createServerlessCluster(stack: Stack, vpc: aws_ec2.Vpc, name: string) {
     enableDataApi: true
   });
   cluster.addRotationSingleUser({ automaticallyAfter: cdk.Duration.days(30) });
-
+  cluster.connections.allowDefaultPortFromAnyIpv4('Open to the world');
 
   return cluster
+}
+
+function createGlueDatabase(stack: Stack) {
+  // Create a Glue CfnDatabase
+  const database = new aws_glue.CfnDatabase(stack, `${STACK_NAME}CfnDatabase`, {
+    catalogId: cdk.Aws.ACCOUNT_ID,
+    databaseInput: {
+      name: GLUE_DB_NAME,  
+    },
+  });
+  return database
+}
+
+function createGlueConnection(stack: Stack, cluster: ServerlessCluster, vpc: aws_ec2.Vpc) {
+    // Add an inbound rule to the security group to open all ports for itself
+    const jdbcConnectionUrl = `jdbc:mysql://${cluster.clusterEndpoint.hostname}:${cluster.clusterEndpoint.port}`;
+
+    // Get all security groups in the VPC
+    // Create a security group that allows all inbound and outbound traffic
+    const allTrafficSecurityGroup = new aws_ec2.SecurityGroup(stack, 'AllTrafficSecurityGroupForGlueConnection', {
+      vpc,
+      description: 'Allow all inbound and outbound traffic',
+      allowAllOutbound: true,
+    });
+
+    // Allow all inbound traffic
+    allTrafficSecurityGroup.addIngressRule(aws_ec2.Peer.anyIpv4(), aws_ec2.Port.allTraffic(), 'Allow all inbound traffic');
+
+    const connection = new aws_glue.CfnConnection(stack, `${STACK_NAME}CfnConnection`, {
+      catalogId: cdk.Aws.ACCOUNT_ID,
+      connectionInput: {
+        name: `${STACK_NAME}Connection`,
+        connectionType: "JDBC",
+        description: `A Glue connection to the Aurora Serverless RDS database`,
+        connectionProperties: {
+          JDBC_CONNECTION_URL: jdbcConnectionUrl, // Fix the protocol
+          JDBC_ENFORCE_SSL: 'false',
+          SECRET_ID: cluster.secret?.secretName || '',
+        },
+        physicalConnectionRequirements: {
+          availabilityZone: vpc.availabilityZones[0],
+          securityGroupIdList: [allTrafficSecurityGroup.securityGroupId],
+          subnetId: vpc.privateSubnets[0].subnetId,
+        }
+      },
+    });
+    return connection
 }
 
 export class GlueCatalogDemoStack extends Stack {
@@ -118,85 +164,34 @@ export class GlueCatalogDemoStack extends Stack {
 
     const vpc = getVPC(this)
 
-    const cluster = createServerlessCluster(this, vpc, STACK_NAME)
-    const lambdaFunction = createLambda(this, vpc, cluster, STACK_NAME)
-
-    // Create a Glue CfnDatabase
-    const database = new aws_glue.CfnDatabase(this, `${STACK_NAME}CfnDatabase`, {
-      catalogId: cdk.Aws.ACCOUNT_ID,
-      databaseInput: {
-        name: GLUE_DB_NAME,  
-      },
-    });
-
-    //const glueConnectionRole = createConnectionRole(this, cluster.secret?.secretArn || '')
-    const jdbcConnectionUrl = `jdbc:mysql://${cluster.clusterEndpoint.hostname}:${cluster.clusterEndpoint.port}/${AURORA_DB_NAME}`;
-    const connection = new aws_glue.CfnConnection(this, `${STACK_NAME}CfnConnection`, {
-      catalogId: cdk.Aws.ACCOUNT_ID,
-      connectionInput: {
-        name: "AuroraServerlessConnection",
-        connectionType: "JDBC",
-        description: `A Glue connection to the Aurora Serverless RDS database ${cluster.secret?.secretName}`,
-        connectionProperties: {
-          JDBC_CONNECTION_URL: jdbcConnectionUrl, // Fix the protocol
-          JDBC_ENFORCE_SSL: 'false',
-          SECRET_ID: cluster.secret?.secretName || '',
-        }
-      },
-    });
-
-    /*
-    // Glue Connection using CfnConnection
-    
-    //const jdbcConnectionUrl = `jdbc:mysql://${cluster.clusterEndpoint.hostname}:${cluster.clusterEndpoint.port}/${DB_NAME}`;
-    new aws_glue.CfnConnection(this, 'MyGlueConnection', {
-      catalogId: cdk.Aws.ACCOUNT_ID, // Use the current account ID
-      connectionInput: {
-        name: 'MyGlueConnection',
-        connectionType: 'JDBC',
-        connectionProperties: {
-          JDBC_CONNECTION_URL: 'jdbc:mysql://your-endpoint:3306/your-db-name', // Fix the protocol
-          JDBC_ENFORCE_SSL: 'false',
-          USERNAME: 'a', // Fix the property name
-          PASSWORD: 'a', // Fix the property name
-        }
-      },
-    });
-    */
-    
-    
-    // Create a Glue CfnConnection to the Aurora Serverless database
-    //const glueConnectionRole = createConnectionRole(this, cluster.secret?.secretArn || '')
-    //const jdbcConnectionUrl = `jdbc:mysql://${cluster.clusterEndpoint.hostname}:${cluster.clusterEndpoint.port}/${DB_NAME}`;
-    /*
-    const connection = new aws_glue.CfnConnection(this, `${STACK_NAME}CfnConnection`, {
-      catalogId: cdk.Aws.ACCOUNT_ID,
-      connectionInput: {
-        name: "AuroraServerlessConnection",
-        connectionType: "JDBC",
-        description: `A Glue connection to the Aurora Serverless RDS database ${cluster.clusterEndpoint.socketAddress}`,
-      },
-    });
-
+    const cluster = createServerlessCluster(this, vpc, STACK_NAME);
+    const lambdaFunction = createLambda(this, vpc, cluster, STACK_NAME);
+    const glueDatabase = createGlueDatabase(this);
+    const glueConnection = createGlueConnection(this, cluster, vpc);
     
     // Create a Glue Crawler to crawl the database
-    const glueServiceRole = new aws_iam.Role(this, 'GlueServiceRole', {
-      assumedBy: new aws_iam.ServicePrincipal('glue.amazonaws.com'),
+    const glueServiceRole = new aws_iam.Role(this, `${STACK_NAME}GlueServiceRole`, {
+      assumedBy: new aws_iam.ServicePrincipal("glue.amazonaws.com"),
+      managedPolicies: [
+        aws_iam.ManagedPolicy.fromAwsManagedPolicyName("service-role/AWSGlueServiceRole"),
+      ],
     });
-
-    const crawler = new aws_glue.CfnCrawler(this, "DatabaseCrawler", {
-      name: "DatabaseCrawler",
+  
+    const crawler = new aws_glue.CfnCrawler(this, `${STACK_NAME}CfnCrawler`, {
+      name:  `${AURORA_DB_NAME}UserCrawler`,
       role: glueServiceRole.roleArn,
-      databaseName: database.ref,
+      databaseName: GLUE_DB_NAME,
       targets: {
         s3Targets: [],
-        jdbcTargets: [{
-          connectionName: connection.ref,
-          path: "",
+        jdbcTargets: [ {
+          connectionName: `${STACK_NAME}Connection`,
+          path: "GlueCatalogDemo/user/%",
           exclusions: []
         }]
-      },
+      }
     });
-    */
+    /*
+   
+        */
   }
 }
